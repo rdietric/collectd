@@ -23,13 +23,14 @@ static int  startSecond = 20;
 
 static int likwid_verbose = 1;
 
-static bool summarizeFlops = true;
-static int sumFlopsGroupId = -1;
-static int sumFlopsMetricId = -1;
-// TODO: different handling, if no or only one FLOP metric is measured
+static bool summarizeFlops = false;
+static bool normalizeFlops = false;
 
 static int numCPUs = 0;
 static int* cpus = NULL;
+
+static char* normalizedFlopsName = "flops_any";
+static double* flopsValues = NULL; /**< storage to normalize FLOPS values flopsValues[cpu] */
 
 static int numSockets = 0;
 static int* socketInfoCores = NULL;
@@ -39,7 +40,6 @@ typedef struct metric_st {
   char* name;     /*!< metric name */
   uint8_t xFlops; /*!< if > 0, it is a FLOPS metric and the value is 
                        the multiplier for normalization */
-  double *values; /*!< values for each CPU or socket */
   bool percpu;    /*!< true, if values are per CPU, otherwise per socket is assumed */
 }metric_t;
 
@@ -54,9 +54,9 @@ typedef struct metric_group_st {
 static int numGroups = 0;
 static metric_group_t* metricGroups = NULL;
 
-int numValues = 0;       /**< number of values for next dispatch */
-value_t* values = NULL;  /**< values to dispatch */
-char* valueNames = NULL; /**< Metric name of the dispatched values */
+/**< array of per socket metric names */
+static int numSocketMetrics = 0;
+static char** perSocketMetrics = NULL;
 
 static char* mystrdup(const char *s)
 {
@@ -67,17 +67,17 @@ static char* mystrdup(const char *s)
   return (char*) memcpy (result, s, len);
 }
 
-/*! brief Determines by metric name, whether this is a per CPU or per socket metric */
+/*! brief Determines by metric name, whether this is a per CPU or per socket metric. 
+The default is "per CPU" */
 static bool _isMetricPerCPU(const char* metric)
 {
-  if(0 == strncmp("mem_bw", metric, 6) || 0 == strncmp("rapl_power", metric, 6))
-  {
-    return false;
+  for(int i = 0; i < numSocketMetrics; i++) {
+    if(0 == strncmp(perSocketMetrics[i], metric, 6)) {
+      return false;
+    }
   }
-  else
-  {
-    return true;
-  }
+
+  return true;
 }
 
 void _setupGroups()
@@ -89,11 +89,9 @@ void _setupGroups()
   }
 
   INFO(PLUGIN_NAME ": Setup metric groups");
+ 
+  int numFlopMetrics = 0;
 
-  //int numFlopMetrics = 0;
-  //TODO: set summarizeFlops = false; if less than two FLOP metrics are measured
-  //      no values allocation needed
-  
   // set the group IDs and metric names
   for(int g = 0; g < numGroups; g++)
   {
@@ -103,7 +101,8 @@ void _setupGroups()
       if(gid < 0)
       {
         metricGroups[g].id = -2;
-        INFO(PLUGIN_NAME ": Failed to add group %s to LIKWID perfmon module", metricGroups[g].name);
+        INFO(PLUGIN_NAME ": Failed to add group %s to LIKWID perfmon module", 
+            metricGroups[g].name);
       }
       else
       {
@@ -140,26 +139,11 @@ void _setupGroups()
           // determine if metric is per CPU or per socket (by name)
           metrics[m].percpu = _isMetricPerCPU(metrics[m].name);
 
-          // allocate memory for each CPU (value)
-          metrics[m].values = (double*)malloc(numCPUs * sizeof(double));
-          if(NULL == metrics[m].values)
-          {
-            metricGroups[g].id = -2;
-            WARNING(PLUGIN_NAME "Disable group %s as memory for metric cpu values could not be allocated", metricGroups[g].name);
-            continue;
-          }
-
-          size_t mlen = strlen(metrics[m].name);
-
-          // initialize all CPU values to -1.0
-          for( int c = 0; c < numCPUs; c++ )
-          {
-            metrics[m].values[c] = -1.0;
-          }
-
           // normalize flops, if enabled
-          if( summarizeFlops && 0 == strncmp("flops", metrics[m].name, 5) )
+          if( normalizeFlops && 0 == strncmp("flops", metrics[m].name, 5) )
           {
+            numFlopMetrics++;
+
             // double precision to single precision = factor 2
             if(0 == strncmp("dp", metrics[m].name + 6, 5))
             {
@@ -173,14 +157,6 @@ void _setupGroups()
             else // assume single precision otherwise
             {
               metrics[m].xFlops = 1;
-            }
-            
-            /* use the first metric in the list that starts with "flops" to store 
-               total normalized flops */
-            if(sumFlopsMetricId == -1)
-            {
-              sumFlopsMetricId = m;
-              sumFlopsGroupId = g;
             }
           }
           else
@@ -196,6 +172,25 @@ void _setupGroups()
       metricGroups[g].id = -1;
     }
   } // END: for groups
+
+  // check if FLOPS have to be aggregated (if more than one FLOP metric is collected),
+  // which requires to allocate memory for each metric per core
+  if (numFlopMetrics > 1) {
+    INFO(PLUGIN_NAME ": Different FLOPS are aggregated and normalized.");
+    summarizeFlops = true;
+
+    flopsValues = (double*)malloc(numCPUs * sizeof(double));
+    if (flopsValues) {
+      // initialize with -1 (invalid value)
+      memset(flopsValues, -1.0, numCPUs * sizeof(double));
+    } else {
+      WARNING(PLUGIN_NAME ": Could not allocate memory for normalization of FLOPS. Disable summarization of FLOPS.");
+      summarizeFlops = false;
+    }
+  }
+
+  // no need to handle different FLOPS in the same metric group, as this could
+  // be handled directly in the Likwid metric group files
 }
 
 static int _init_likwid(void)
@@ -271,8 +266,7 @@ static void _resetCounters(void)
 
 static const char* _getMeasurementName(metric_t *metric)
 {
-  if(metric->percpu)
-  {
+  if(metric->percpu) {
     return "likwid_cpu";
   }
   else
@@ -284,10 +278,8 @@ static const char* _getMeasurementName(metric_t *metric)
 /*! brief: cpu_idx is the index in the CPU array */
 static bool _isSocketInfoCore(int cpu_idx)
 {
-  for(int s = 0; s < numSockets; s++) 
-  {
-    if(cpu_idx == socketInfoCores[s])
-    {
+  for(int s = 0; s < numSockets; s++) {
+    if(cpu_idx == socketInfoCores[s]) {
       return true;
     }
   }
@@ -300,8 +292,7 @@ static bool _isSocketInfoCore(int cpu_idx)
 // the plugin instance stores the CPU ID
 // the type field stores the metric name
 // the type instance stores ???
-static int _submit_value(const char* measurement, const char* metric, int cpu, double value, cdtime_t time)
-{
+static int _submit_value(const char* measurement, const char* metric, int cpu, double value, cdtime_t time) {
   value_list_t vl = VALUE_LIST_INIT;
   value_t v = {.gauge = value};
  
@@ -322,24 +313,20 @@ static int _submit_value(const char* measurement, const char* metric, int cpu, d
   plugin_dispatch_values(&vl);
 }
 
-static int likwid_plugin_read(void) 
-{
+static int likwid_plugin_read(void) {
   cdtime_t time = cdtime() + mcdTime * numGroups;
   
-  INFO (PLUGIN_NAME ": %s:%d (timestamp: %.3f)", __FUNCTION__, __LINE__, CDTIME_T_TO_DOUBLE(time));
+  INFO(PLUGIN_NAME ": %s:%d (timestamp: %.3f)", __FUNCTION__, __LINE__, CDTIME_T_TO_DOUBLE(time));
   
   // read from likwid
-  for(int g = 0; g < numGroups; g++)
-  {
+  for(int g = 0; g < numGroups; g++) {
     int gid = metricGroups[g].id;
-    if(gid < 0)
-    {
+    if(gid < 0) {
       INFO(PLUGIN_NAME ": No eventset specified for group %s", metricGroups[g].name);
       continue;
     }
 
-    if(0 != perfmon_setupCounters(gid))
-    {
+    if(0 != perfmon_setupCounters(gid)) {
       INFO(PLUGIN_NAME ": Could not setup counters for group %s", metricGroups[g].name);
       continue;
     }
@@ -354,113 +341,66 @@ static int likwid_plugin_read(void)
     INFO(PLUGIN_NAME ": Measured %d metrics for %d CPUs for group %s (%d sec)", nmetrics, numCPUs, metricGroups[g].name, mTime);
 
     // for all active hardware threads
-    for(int c = 0; c < numCPUs; c++)
-    {
+    for(int c = 0; c < numCPUs; c++) {
       // for all metrics in the group
-      for(int m = 0; m < nmetrics; m++)
-      {
+      for(int m = 0; m < nmetrics; m++) {
         double metricValue = perfmon_getLastMetric(gid, m, c);
         metric_t *metric = &(metricGroups[g].metrics[m]);
 
         //INFO(PLUGIN_NAME ": %lu - %s(%d):%lf", CDTIME_T_TO_TIME_T(time), metric->name, cpus[c], metricValue);
 
+        char* metricName = metric->name; 
+  
         //REMOVE: check that we write the value for the correct metric
-        const char* metricName = perfmon_getMetricName(gid, m);
-        if( 0 != strcmp(metricName, metric->name))
-        {
+        if ( 0 != strcmp(metricName, perfmon_getMetricName(gid, m))) {
           WARNING(PLUGIN_NAME ": Something went wrong!!!");
         }
 
         // skip cores that do not provide values for per socket metrics
-        if(!metric->percpu && !_isSocketInfoCore(c))
-        {
+        if (!metric->percpu && !_isSocketInfoCore(c)) {
           continue;
         }
 
-        // normalize FLOP values to single precision
-        if(summarizeFlops)
-        {
-          // if it is a flop metric
-          if(metric->xFlops > 0)
-          {
-            // normalize, if it is not single precision
-            if(metric->xFlops > 1 && metricValue > 0)
-            {
+        // special handling for FLOPS metrics
+        if (metric->xFlops > 0) {
+          // if user requested FLOPS normalization
+          if(normalizeFlops) {
+            // normalize FLOPS that are not already single precision (if requested)
+            if(metric->xFlops > 1 && metricValue > 0) {
               metricValue *= metric->xFlops;
             }
 
+            metricName = normalizedFlopsName;
+          }
+
+          // if there are at least two FLOPS metrics, aggregate their normalized values
+          if (summarizeFlops) {
             //INFO(PLUGIN_NAME " FLOPS value set/add: %lu - %s(%d):%lf", CDTIME_T_TO_TIME_T(time), metric->name, cpus[c], metricValue);
 
-            // set or add FLOPS
-            // summarize into first "flop" metric that occurs
-            if(-1 == metricGroups[sumFlopsGroupId].metrics[sumFlopsMetricId].values[c])
-            {
-              metricGroups[sumFlopsGroupId].metrics[sumFlopsMetricId].values[c] = metricValue;
+            if (-1.0 == flopsValues[c]) {
+              flopsValues[c] = metricValue;
+            } else {
+              flopsValues[c] += metricValue;
             }
-            else
-            {
-              metricGroups[sumFlopsGroupId].metrics[sumFlopsMetricId].values[c] += metricValue;
-            }
-          }
-          else // other metrics than FLOPS
-          {
-            metric->values[c] = metricValue;
+
+            // do not submit yet
+            continue;
           }
         }
-        else  // submit each raw metric
-        {
-          _submit_value(_getMeasurementName(metric), metric->name, cpus[c], metricValue, time);
-        }
+
+        _submit_value(_getMeasurementName(metric), metricName, cpus[c], metricValue, time);
       }
     }
   }
 
+  // submit metrics, if they have been summarized
   if(summarizeFlops)
   {
-    for(int g = 0; g < numGroups; g++)
-    {
-      // skip groups that are not configured or invalid
-      if(metricGroups[g].id < 0)
-      {
-        continue;
-      }
+    for(int c = 0; c < numCPUs; c++) {
+      _submit_value("likwid_cpu", normalizedFlopsName, cpus[c], flopsValues[c], time);
 
-      // for all active hardware threads
-      for(int c = 0; c < numCPUs; c++)
-      {
-        // for all metrics in the group
-        for(int m = 0; m < metricGroups[g].numMetrics; m++)
-        {
-          metric_t *metric = &(metricGroups[g].metrics[m]);
-          double value = metric->values[c];
-
-          // skip uninitialized values
-          if(value == -1)
-          {
-            continue;
-          }
-
-          char* metricName = metric->name;
-
-          // submit only normalized FLOPS (skip flop metrics except for "the chosen one"
-          if(metricGroups[g].metrics[m].xFlops > 0)
-          {
-            if(g == sumFlopsGroupId && m == sumFlopsMetricId)
-            {
-              metricName = "flops_any";
-            }
-            else
-            {
-              continue;
-            }
-          }
-
-          _submit_value(_getMeasurementName(metric), metricName, cpus[c], value, time);
-
-          // reset counter value
-          metricGroups[g].metrics[m].values[c] = -1;
-        }
-      }
+      // reset counter value
+      flopsValues[c] = -1.0;
     }
   }
 
@@ -521,40 +461,40 @@ static int likwid_plugin_finalize( void )
       {
         free(metricGroups[i].name);
       }
-      
-      for(int m = 0; m < metricGroups[i].numMetrics; m++)
-      {
-        if(NULL != metricGroups[i].metrics[m].values)
-        {
-          free(metricGroups[i].metrics[m].values);
-        }
-      }
     }
     free(metricGroups);
+
+    if(flopsValues) {
+      free(flopsValues);
+    }
   }
-  //INFO(PLUGIN_NAME ": freed allocated memory");
 
   return 0;
 }
 
 static const char *config_keys[] =
 {
-  "SummarizeFlops",
+  "NormalizeFlops",
   "AccessMode",
-  "mtime",
-  "groups",
-  "StartSecond",
-  "verbose"
+  "Mtime",
+  "Groups",
+  "PerSocketMetrics",
+  "Verbose"
 };
 static int config_keys_num = STATIC_ARRAY_SIZE(config_keys);
 
 static int likwid_plugin_config (const char *key, const char *value)
 {
   INFO (PLUGIN_NAME " config: %s := %s", key, value);
+
+  // use comma to separate metrics and metric groups
+  static char separator = ' ';
   
-  if (strcasecmp(key, "SummarizeFlops") == 0)
+  if (strcasecmp(key, "NormalizeFlops") == 0)
   {
-    summarizeFlops = IS_TRUE(value);
+    //normalizeFlops = IS_TRUE(value);
+    normalizeFlops = true;
+    normalizedFlopsName = mystrdup(value);
   }
   
   if (strcasecmp(key, "AccessMode") == 0)
@@ -562,25 +502,25 @@ static int likwid_plugin_config (const char *key, const char *value)
     accessMode = atoi(value);
   }
   
-  if (strcasecmp(key, "mtime") == 0)
+  if (strcasecmp(key, "Mtime") == 0)
   {
     mTime = atoi(value);
     //mcdTime = TIME_T_TO_CDTIME_T(mTime);
   }
   
-  if (strcasecmp(key, "verbose") == 0)
+  if (strcasecmp(key, "Verbose") == 0)
   {
     likwid_verbose = atoi(value);
   }
   
-  if (strcasecmp(key, "groups") == 0)
+  if (strcasecmp(key, "Groups") == 0)
   {
     // count number of groups
     numGroups = 1;
     int i = 0;
     while (value[i] != '\0') 
     { 
-      if (value[i] == ' ') 
+      if (value[i] == separator) 
       {
         numGroups++;
       }
@@ -606,7 +546,7 @@ static int likwid_plugin_config (const char *key, const char *value)
     
     i = 0;
     char *grp_ptr;
-    grp_ptr = strtok((char*)value, ",");
+    grp_ptr = strtok((char*)value, &separator);
     while( grp_ptr != NULL )
     {
       // save group name
@@ -614,15 +554,49 @@ static int likwid_plugin_config (const char *key, const char *value)
       INFO(PLUGIN_NAME " Found group: %s", grp_ptr);
       
       // get next group
-      grp_ptr = strtok(NULL, " ");
+      grp_ptr = strtok(NULL, &separator);
       
       i++;
     }
   }
-  
-  if (strcasecmp(key, "StartSecond") == 0)
-  {
-    startSecond = atoi(value);
+
+  if (strcasecmp(key, "PerSocketMetrics") == 0) {
+     // count number of per socket metrics
+    numSocketMetrics = 1;
+    int i = 0;
+    while (value[i] != '\0') 
+    { 
+      if (value[i] == separator) 
+      {
+        numSocketMetrics++;
+      }
+      i++;
+    }
+    
+    // allocate metric group array
+    perSocketMetrics = (char**)malloc(numSocketMetrics * sizeof(char*));
+    if(NULL == perSocketMetrics)
+    {
+      ERROR(PLUGIN_NAME " Could not allocate memory for per socket metrics: %s", value);
+      numSocketMetrics = 0;
+      return 1; // config failed
+    }
+
+    // tokenize the string by separator
+    i = 0;
+    char *metric_ptr;
+    metric_ptr = strtok((char*)value, &separator);
+    while( metric_ptr != NULL )
+    {
+      // save metric name
+      perSocketMetrics[i] = mystrdup(metric_ptr);
+      INFO(PLUGIN_NAME " Found group: %s", metric_ptr);
+      
+      // get next group
+      metric_ptr = strtok(NULL, &separator);
+      
+      i++;
+    }
   }
   
   return 0;
