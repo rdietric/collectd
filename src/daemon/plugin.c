@@ -1085,35 +1085,44 @@ static int plugin_insert_read(read_func_t *rf) {
   int status;
   llentry_t *le;
 
-  /* set the time of the first read according to "StartAt" in collectd.conf */
-  double start_time = rf->rf_ctx.start_time;
-  if(start_time < 0) {
-    // no start time given
+  /* set the time of the first read according to "StartRead" in collectd.conf
+     start minute, second, millisecond is given as float in seconds */
+  double start = rf->rf_ctx.start_time; /* (default is -1.0) */
+  if (start < 0) {
+    /* if StartAt is not defined, start reading immediately */
     rf->rf_next_read = cdtime();
   } else {
-    cdtime_t start_cdtms = DOUBLE_TO_CDTIME_T(start_time);
+    /* get minute in hour and second+millisecond in minute */
     cdtime_t now = cdtime();
     struct timeval tv = CDTIME_T_TO_TIMEVAL(now);
-    uint64_t curr_msec = (gmtime(&(tv.tv_sec))->tm_sec) * 1000 + tv.tv_usec/1000;
-    cdtime_t curr_cdtms = MS_TO_CDTIME_T(curr_msec);
- 
-    //NOTICE("%s: current time: %lu sec, %lu ms in minute, start time: %.3lf, interval: %lu", rf->rf_name, tv.tv_sec, curr_msec, start_time, CDTIME_T_TO_MS(rf->rf_interval));
+    uint64_t curr_msec =
+        (((tv.tv_sec / 60) % 60) * 60 // minute of hour in seconds
+         + gmtime(&(tv.tv_sec))->tm_sec) *
+            1000             // add seconds of minute and convert to ms
+        + tv.tv_usec / 1000; // add millisecond of second
 
-    int64_t sleep_cdt = start_cdtms - curr_cdtms;
-    while(sleep_cdt < 0)
-    {
+    /* convert to cdt time */
+    cdtime_t curr_cdt = MS_TO_CDTIME_T(curr_msec);
+    cdtime_t start_cdt = DOUBLE_TO_CDTIME_T(start);
+
+    /* NOTICE("%s: current time: %lu sec, %lu ms in minute, start time: %.3lf,
+    interval: %lu", rf->rf_name, tv.tv_sec, curr_msec, start,
+    CDTIME_T_TO_MS(rf->rf_interval)); */
+
+    /* get time to sleep until next read */
+    int64_t sleep_cdt = start_cdt - curr_cdt;
+    while (sleep_cdt < 0) {
       sleep_cdt += rf->rf_interval;
     }
 
-    if(sleep_cdt > 0)
-    {
+    /* set the next read time */
+    if (sleep_cdt > 0) {
       rf->rf_next_read = now + sleep_cdt;
-      INFO("%s - now: %lu.%lu, first read: %lu (in %lu ms)", 
-        rf->rf_name, tv.tv_sec, tv.tv_usec/1000, 
-        CDTIME_T_TO_TIME_T(rf->rf_next_read), CDTIME_T_TO_MS(sleep_cdt));
-    }
-    else
-    {
+      INFO("%s plugin: wait %.3fms before first read at %ld.%03ds since epoche",
+           rf->rf_name, CDTIME_T_TO_DOUBLE(sleep_cdt),
+           (long int)(CDTIME_T_TO_TIMEVAL(rf->rf_next_read).tv_sec),
+           (int)(CDTIME_T_TO_TIMEVAL(rf->rf_next_read).tv_usec / 1000));
+    } else {
       rf->rf_next_read = cdtime();
     }
   }
@@ -2588,9 +2597,10 @@ EXPORT double plugin_get_start_time(void) {
     return start_time;
 
   // StartAt is optional and the default is set to -1
-  //P_ERROR("plugin_get_start_time: Unable to determine start time from context.");
+  // P_ERROR("plugin_get_start_time: Unable to determine start time from
+  // context.");
 
-  return cf_get_default_start_time();
+  return cf_get_default_start_read();
 } /* double plugin_get_start_time */
 
 typedef struct {
