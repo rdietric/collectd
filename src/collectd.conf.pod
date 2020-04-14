@@ -139,6 +139,16 @@ defined in this plugin. By default, this is disabled.
 
 Specifies the value of the timeout argument of the flush callback.
 
+=item B<AlignRead> B<false>|B<true>
+
+Enables or disables the plugin-specific alignment of calls to read functions. 
+This overrides the global B<AlignRead> setting. 
+
+=item B<AlignReadOffset> I<Seconds>
+
+Enables aligned calls to read functions of the plugin and additionally specifies
+an offset, in seconds, until the interval begin will be further delayed.
+
 =back
 
 =item B<AutoLoadPlugin> B<false>|B<true>
@@ -264,6 +274,12 @@ to get data.
 
 This options limits the maximum value of the interval. The default value is
 B<86400>.
+
+=item B<AlignRead> B<false>|B<true>
+
+If enabled, the call to read functions is set to a multiple of the read 
+interval, which allows round timestamps or the same timestamps across systems 
+to be recorded. This option is disabled by default.
 
 =item B<Timeout> I<Iterations>
 
