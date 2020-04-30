@@ -106,7 +106,7 @@ static cf_global_option_t cf_global_options[] = {
     {"Hostname", NULL, 0, NULL},
     {"FQDNLookup", NULL, 0, "true"},
     {"Interval", NULL, 0, NULL},
-    {"ReadAlign", NULL, 0, "false"},
+    {"AlignRead", NULL, 0, "false"},
     {"ReadThreads", NULL, 0, "5"},
     {"WriteThreads", NULL, 0, "5"},
     {"WriteQueueLimitHigh", NULL, 0, NULL},
